@@ -422,6 +422,13 @@ fn get_backend_model_type(
         }
     }
 
+    // BGE-M3 model detection - allow BgeM3Sparse pooling for XLM-RoBERTa models with "bge-m3" in path
+    if Some(text_embeddings_backend::Pool::BgeM3Sparse) == pooling {
+        return Ok(text_embeddings_backend::ModelType::Embedding(
+            text_embeddings_backend::Pool::BgeM3Sparse,
+        ));
+    }
+
     if Some(text_embeddings_backend::Pool::Splade) == pooling {
         return Err(anyhow!(
             "Splade pooling is not supported: model is not a ForMaskedLM model"

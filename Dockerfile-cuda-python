@@ -1,0 +1,111 @@
+ARG PLATFORM=cuda
+FROM lukemathwalker/cargo-chef:latest-rust-1.85-bookworm AS chef
+WORKDIR /usr/src
+
+ENV SCCACHE=0.10.0
+ENV RUSTC_WRAPPER=/usr/local/bin/sccache
+
+# Download and configure sccache
+RUN curl -fsSL https://github.com/mozilla/sccache/releases/download/v$SCCACHE/sccache-v$SCCACHE-x86_64-unknown-linux-musl.tar.gz | tar -xzv --strip-components=1 -C /usr/local/bin sccache-v$SCCACHE-x86_64-unknown-linux-musl/sccache && \
+    chmod +x /usr/local/bin/sccache
+
+FROM chef AS planner
+
+COPY backends backends
+COPY core core
+COPY router router
+COPY Cargo.toml ./
+COPY Cargo.lock ./
+
+RUN cargo chef prepare  --recipe-path recipe.json
+
+FROM chef AS builder
+
+ARG GIT_SHA
+ARG DOCKER_LABEL
+
+# sccache specific variables
+ARG SCCACHE_GHA_ENABLED
+
+COPY --from=planner /usr/src/recipe.json recipe.json
+
+RUN --mount=type=secret,id=actions_results_url,env=ACTIONS_RESULTS_URL \
+    --mount=type=secret,id=actions_runtime_token,env=ACTIONS_RUNTIME_TOKEN \
+    cargo chef cook --release --features python --no-default-features --recipe-path recipe.json && sccache -s
+
+COPY backends backends
+COPY core core
+COPY router router
+COPY Cargo.toml ./
+COPY Cargo.lock ./
+
+RUN PROTOC_ZIP=protoc-21.12-linux-x86_64.zip && \
+    curl -OL https://github.com/protocolbuffers/protobuf/releases/download/v21.12/$PROTOC_ZIP && \
+    unzip -o $PROTOC_ZIP -d /usr/local bin/protoc && \
+    unzip -o $PROTOC_ZIP -d /usr/local 'include/*' && \
+    rm -f $PROTOC_ZIP
+
+FROM builder AS http-builder
+
+RUN --mount=type=secret,id=actions_results_url,env=ACTIONS_RESULTS_URL \
+    --mount=type=secret,id=actions_runtime_token,env=ACTIONS_RUNTIME_TOKEN \
+    cargo build --release --bin text-embeddings-router -F python -F http --no-default-features && sccache -s
+
+FROM builder AS grpc-builder
+
+COPY proto proto
+
+RUN --mount=type=secret,id=actions_results_url,env=ACTIONS_RESULTS_URL \
+    --mount=type=secret,id=actions_runtime_token,env=ACTIONS_RUNTIME_TOKEN \
+    cargo build --release --bin text-embeddings-router -F grpc -F python --no-default-features && sccache -s
+
+# CUDA base image with PyTorch for H100 (compute capability 9.0)
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04 AS cuda
+
+ENV HUGGINGFACE_HUB_CACHE=/data \
+    PORT=80 \
+    DEBIAN_FRONTEND=noninteractive
+
+# Install Python and build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        git \
+        cmake \
+        ninja-build \
+        python3 \
+        python3-pip \
+        python3-dev \
+        ca-certificates \
+        curl \
+        libssl-dev && \
+    rm -rf /var/lib/apt/lists/* && \
+    ln -s /usr/bin/python3 /usr/bin/python
+
+WORKDIR /usr/src
+
+# Install PyTorch with CUDA 12.4 support (for H100)
+RUN pip install --no-cache-dir torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu124
+
+# Copy Python backend
+COPY backends backends
+COPY backends/python/server/text_embeddings_server/models/__init__.py backends/python/server/text_embeddings_server/models/__init__.py
+COPY backends/python/server/pyproject.toml backends/python/server/pyproject.toml
+COPY backends/python/server/requirements.txt backends/python/server/requirements.txt
+
+# Install Python dependencies
+RUN cd backends/python/server && \
+    make install
+
+FROM ${PLATFORM} AS grpc
+
+COPY --from=grpc-builder /usr/src/target/release/text-embeddings-router /usr/local/bin/text-embeddings-router
+
+ENTRYPOINT ["text-embeddings-router"]
+CMD ["--json-output"]
+
+FROM ${PLATFORM}
+
+COPY --from=http-builder /usr/src/target/release/text-embeddings-router /usr/local/bin/text-embeddings-router
+
+ENTRYPOINT ["text-embeddings-router"]
+CMD ["--json-output"]

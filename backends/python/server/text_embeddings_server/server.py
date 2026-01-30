@@ -30,7 +30,12 @@ class EmbeddingService(embed_pb2_grpc.EmbeddingServiceServicer):
             request, self.model.device, max_input_length
         )
 
-        embeddings = self.model.embed(batch)
+        # Check if model has embed_sparse method and should use it
+        # This is for BGE-M3 sparse pooling mode
+        if hasattr(self.model, 'embed_sparse') and hasattr(self.model, 'pool') and self.model.pool == 'bge-m3-sparse':
+            embeddings = self.model.embed_sparse(batch)
+        else:
+            embeddings = self.model.embed(batch)
 
         return embed_pb2.EmbedResponse(embeddings=embeddings)
 

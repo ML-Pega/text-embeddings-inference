@@ -67,6 +67,10 @@ pub enum Pool {
     Splade,
     /// Select the last token as embedding
     LastToken,
+    /// BGE-M3 native sparse embeddings using FlagEmbedding.
+    /// This option is available for BGE-M3 models and uses the model's native sparse
+    /// embedding capability instead of SPLADE.
+    BgeM3Sparse,
 }
 
 impl fmt::Display for Pool {
@@ -76,6 +80,7 @@ impl fmt::Display for Pool {
             Pool::Mean => write!(f, "mean"),
             Pool::Splade => write!(f, "splade"),
             Pool::LastToken => write!(f, "last_token"),
+            Pool::BgeM3Sparse => write!(f, "bge-m3-sparse"),
         }
     }
 }

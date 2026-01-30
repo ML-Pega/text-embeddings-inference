@@ -14,6 +14,7 @@ from text_embeddings_server.models.classification_model import ClassificationMod
 from text_embeddings_server.models.jinaBert_model import FlashJinaBert
 from text_embeddings_server.models.flash_mistral import FlashMistral
 from text_embeddings_server.models.flash_qwen3 import FlashQwen3
+from text_embeddings_server.models.bge_m3_model import BGEM3Model
 from text_embeddings_server.utils.device import get_device, use_ipex
 
 __all__ = ["Model"]
@@ -84,6 +85,11 @@ def get_model(model_path: Path, dtype: Optional[str], pool: str):
     ):
         # Add specific offline modeling for model "jinaai/jina-embeddings-v2-base-code" which uses "autoMap" to reference code in other repository
         return create_model(FlashJinaBert, model_path, device, datatype)
+
+    # BGE-M3 model detection - uses FlagEmbedding for native sparse support
+    if config.model_type == "xlm-roberta" and "bge-m3" in str(model_path).lower():
+        logger.info("Detected BGE-M3 model, using BGEM3Model with FlagEmbedding for sparse support")
+        return create_model(BGEM3Model, model_path, device, datatype, pool)
 
     if config.model_type == "bert":
         config: BertConfig

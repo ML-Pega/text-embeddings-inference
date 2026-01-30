@@ -1822,7 +1822,7 @@ pub async fn run(
                         .route("/", post(similarity))
                         // AWS Sagemaker route
                         .route("/invocations", post(similarity))
-                } else if model.pooling == "splade" {
+                } else if model.pooling == "splade" || model.pooling == "bge-m3-sparse" {
                     routes
                         .route("/", post(embed_sparse))
                         // AWS Sagemaker route

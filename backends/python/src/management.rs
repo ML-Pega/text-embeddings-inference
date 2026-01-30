@@ -37,6 +37,7 @@ impl BackendProcess {
             Pool::Mean => "mean",
             Pool::LastToken => "lasttoken",
             Pool::Splade => "splade",
+            Pool::BgeM3Sparse => "bge-m3-sparse",
         };
 
         // Process args

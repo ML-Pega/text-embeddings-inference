@@ -507,6 +507,7 @@ impl Infer {
         matches!(
             self.backend.model_type,
             ModelType::Embedding(text_embeddings_backend::Pool::Splade)
+                | ModelType::Embedding(text_embeddings_backend::Pool::BgeM3Sparse)
         )
     }
 
