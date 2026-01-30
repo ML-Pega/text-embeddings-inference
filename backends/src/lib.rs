@@ -359,6 +359,18 @@ impl Backend {
             "Backend blocking task dropped the sender without send a response. This is a bug.",
         )
     }
+
+    #[instrument(skip_all)]
+    pub async fn embed_sparse(&self, batch: Batch) -> Result<(Embeddings, Duration), BackendError> {
+        let (sender, receiver) = oneshot::channel();
+
+        self.backend_sender
+            .try_send(BackendCommand::EmbedSparse(batch, Span::current(), sender))
+            .expect("No backend receiver. This is a bug.");
+        receiver.await.expect(
+            "Backend blocking task dropped the sender without send a response. This is a bug.",
+        )
+    }
 }
 
 #[allow(unused, clippy::too_many_arguments)]
@@ -555,6 +567,13 @@ impl BackendThread {
                             (e, start.elapsed())
                         }));
                     }
+                    BackendCommand::EmbedSparse(batch, span, sender) => {
+                        let _span = span.entered();
+                        let _ = sender.send(backend.embed_sparse(batch).map(|e| {
+                            healthy = true;
+                            (e, start.elapsed())
+                        }));
+                    }
                     BackendCommand::Predict(batch, span, sender) => {
                         let _span = span.entered();
                         let _ = sender.send(backend.predict(batch).map(|e| {
@@ -579,6 +598,11 @@ impl Drop for BackendThread {
 enum BackendCommand {
     Health(Span, oneshot::Sender<Result<(), BackendError>>),
     Embed(
+        Batch,
+        Span,
+        oneshot::Sender<Result<(Embeddings, Duration), BackendError>>,
+    ),
+    EmbedSparse(
         Batch,
         Span,
         oneshot::Sender<Result<(Embeddings, Duration), BackendError>>,

@@ -39,6 +39,22 @@ class EmbeddingService(embed_pb2_grpc.EmbeddingServiceServicer):
 
         return embed_pb2.EmbedResponse(embeddings=embeddings)
 
+    async def EmbedSparse(self, request, context):
+        """Separate gRPC method for sparse embeddings (used by bge-m3-all mode)"""
+        max_input_length = self.model.max_input_length
+        batch = self.model.batch_type.from_pb(
+            request, self.model.device, max_input_length
+        )
+
+        # Call embed_sparse if available, otherwise fall back to embed
+        if hasattr(self.model, 'embed_sparse'):
+            embeddings = self.model.embed_sparse(batch)
+        else:
+            # Fallback for models without embed_sparse
+            embeddings = self.model.embed(batch)
+
+        return embed_pb2.EmbedResponse(embeddings=embeddings)
+
     async def Predict(self, request, context):
         max_input_length = self.model.max_input_length
         batch = self.model.batch_type.from_pb(

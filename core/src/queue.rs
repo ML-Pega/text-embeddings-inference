@@ -29,6 +29,8 @@ pub struct Metadata {
     pub(crate) prompt_tokens: usize,
     /// Pooled embedding
     pub(crate) pooling: bool,
+    /// Sparse embedding request (for BGE-M3 sparse mode)
+    pub(crate) sparse: bool,
 }
 
 /// Request Queue

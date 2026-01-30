@@ -86,10 +86,26 @@ class BGEM3Model(Model):
             input_ids = batch.input_ids[i]
             # Remove padding (attention_mask == 0)
             attention_mask = batch.attention_mask[i]
-            valid_length = attention_mask.sum().item()
+            valid_length = int(attention_mask.sum().item())
+            
+            if valid_length == 0:
+                # Edge case: empty input, use placeholder
+                texts.append(" ")
+                continue
+                
             valid_ids = input_ids[:valid_length].tolist()
-            # Decode to text
+            
+            # Decode to text - first try without special tokens
             text = self._tokenizer.decode(valid_ids, skip_special_tokens=True)
+            
+            # If result is empty, try keeping special tokens
+            if not text or not text.strip():
+                text = self._tokenizer.decode(valid_ids, skip_special_tokens=False)
+            
+            # Final fallback: use a space to avoid empty input
+            if not text or not text.strip():
+                text = " "
+            
             texts.append(text)
         return texts
 

@@ -44,6 +44,12 @@ pub trait Backend {
 
     fn embed(&self, batch: Batch) -> Result<Embeddings, BackendError>;
 
+    /// Sparse embedding method for BGE-M3 sparse mode.
+    /// Default implementation falls back to embed().
+    fn embed_sparse(&self, batch: Batch) -> Result<Embeddings, BackendError> {
+        self.embed(batch)
+    }
+
     fn predict(&self, batch: Batch) -> Result<Predictions, BackendError>;
 }
 
@@ -71,6 +77,9 @@ pub enum Pool {
     /// This option is available for BGE-M3 models and uses the model's native sparse
     /// embedding capability instead of SPLADE.
     BgeM3Sparse,
+    /// BGE-M3 dual mode: supports both dense (/embed) and sparse (/embed_sparse) endpoints.
+    /// Use this to serve both embedding types from a single service.
+    BgeM3All,
 }
 
 impl fmt::Display for Pool {
@@ -81,6 +90,7 @@ impl fmt::Display for Pool {
             Pool::Splade => write!(f, "splade"),
             Pool::LastToken => write!(f, "last_token"),
             Pool::BgeM3Sparse => write!(f, "bge-m3-sparse"),
+            Pool::BgeM3All => write!(f, "bge-m3-all"),
         }
     }
 }

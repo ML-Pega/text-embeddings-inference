@@ -1827,6 +1827,13 @@ pub async fn run(
                         .route("/", post(embed_sparse))
                         // AWS Sagemaker route
                         .route("/invocations", post(embed_sparse))
+                } else if model.pooling == "bge-m3-all" {
+                    // Dual mode: both /embed and /embed_sparse are available via base routes
+                    // Just set the default / route to dense embedding
+                    routes
+                        .route("/", post(embed))
+                        // AWS Sagemaker route defaults to dense
+                        .route("/invocations", post(embed))
                 } else {
                     routes
                         .route("/", post(embed))

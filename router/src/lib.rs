@@ -422,10 +422,15 @@ fn get_backend_model_type(
         }
     }
 
-    // BGE-M3 model detection - allow BgeM3Sparse pooling for XLM-RoBERTa models with "bge-m3" in path
+    // BGE-M3 model detection - allow BgeM3Sparse and BgeM3All pooling for XLM-RoBERTa models with "bge-m3" in path
     if Some(text_embeddings_backend::Pool::BgeM3Sparse) == pooling {
         return Ok(text_embeddings_backend::ModelType::Embedding(
             text_embeddings_backend::Pool::BgeM3Sparse,
+        ));
+    }
+    if Some(text_embeddings_backend::Pool::BgeM3All) == pooling {
+        return Ok(text_embeddings_backend::ModelType::Embedding(
+            text_embeddings_backend::Pool::BgeM3All,
         ));
     }
 

@@ -68,16 +68,16 @@ ENV HUGGINGFACE_HUB_CACHE=/data \
 
 # Install Python and build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential \
-        git \
-        cmake \
-        ninja-build \
-        python3 \
-        python3-pip \
-        python3-dev \
-        ca-certificates \
-        curl \
-        libssl-dev && \
+    build-essential \
+    git \
+    cmake \
+    ninja-build \
+    python3 \
+    python3-pip \
+    python3-dev \
+    ca-certificates \
+    curl \
+    libssl-dev && \
     rm -rf /var/lib/apt/lists/* && \
     ln -s /usr/bin/python3 /usr/bin/python
 
@@ -85,6 +85,12 @@ WORKDIR /usr/src
 
 # Install PyTorch with CUDA 12.4 support (for H100)
 RUN pip install --no-cache-dir torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu124
+
+# Install Flash Attention 2 using pre-built wheel (avoids nvcc requirement)
+# Flash Attention 2.7.3 for CUDA 12.4 and PyTorch 2.5.1
+RUN pip install --no-cache-dir flash-attn --no-build-isolation 2>/dev/null || \
+    pip install --no-cache-dir https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.3/flash_attn-2.7.3+cu124torch2.5cxx11abiFALSE-cp310-cp310-linux_x86_64.whl || \
+    echo "Flash Attention wheel not available, skipping"
 
 # Copy Python backend
 COPY backends backends

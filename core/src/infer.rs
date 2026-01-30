@@ -142,6 +142,7 @@ impl Infer {
                 truncation_direction,
                 prompt_name,
                 false,
+                false,  // sparse=false for embed_all
                 &start_time,
                 permit,
             )
@@ -193,6 +194,7 @@ impl Infer {
                 truncation_direction,
                 prompt_name,
                 true,
+                true,  // sparse=true for embed_sparse
                 &start_time,
                 permit,
             )
@@ -234,7 +236,7 @@ impl Infer {
     ) -> Result<PooledEmbeddingsInferResponse, TextEmbeddingsError> {
         let start_time = Instant::now();
 
-        if self.is_splade() && normalize {
+        if self.is_splade_only() && normalize {
             let counter = metrics::counter!("te_request_failure", "err" => "model_type");
             counter.increment(1);
 
@@ -261,6 +263,7 @@ impl Infer {
                 truncation_direction,
                 prompt_name,
                 true,
+                false,  // sparse=false for embed_pooled
                 &start_time,
                 permit,
             )
@@ -328,6 +331,7 @@ impl Infer {
         truncation_direction: TruncationDirection,
         prompt_name: Option<String>,
         pooling: bool,
+        sparse: bool,
         start_time: &Instant,
         _permit: OwnedSemaphorePermit,
     ) -> Result<InferResult, TextEmbeddingsError> {
@@ -367,6 +371,7 @@ impl Infer {
                 queue_time: Instant::now(),
                 prompt_tokens: encoding.input_ids.len(),
                 pooling,
+                sparse,
             },
             encoding,
         });
@@ -433,6 +438,7 @@ impl Infer {
                 queue_time: Instant::now(),
                 prompt_tokens: encoding.input_ids.len(),
                 pooling: true,
+                sparse: false,
             },
             encoding,
         });
@@ -504,6 +510,18 @@ impl Infer {
 
     #[instrument(skip(self))]
     pub fn is_splade(&self) -> bool {
+        matches!(
+            self.backend.model_type,
+            ModelType::Embedding(text_embeddings_backend::Pool::Splade)
+                | ModelType::Embedding(text_embeddings_backend::Pool::BgeM3Sparse)
+                | ModelType::Embedding(text_embeddings_backend::Pool::BgeM3All)
+        )
+    }
+
+    /// Check if model is exclusively SPLADE (not BGE-M3 dual mode)
+    /// Used for normalize check - BgeM3All supports normalize for dense embeddings
+    #[instrument(skip(self))]
+    pub fn is_splade_only(&self) -> bool {
         matches!(
             self.backend.model_type,
             ModelType::Embedding(text_embeddings_backend::Pool::Splade)
@@ -580,7 +598,15 @@ async fn backend_task(backend: Backend, mut embed_receiver: mpsc::Receiver<NextB
                 });
             }
             ModelType::Embedding(_) => {
-                let results = backend.embed(batch.1).await;
+                // Check if any request in the batch is a sparse request
+                let is_sparse_batch = batch.0.iter().any(|m| m.sparse);
+                
+                // Route to appropriate backend method
+                let results = if is_sparse_batch {
+                    backend.embed_sparse(batch.1).await
+                } else {
+                    backend.embed(batch.1).await
+                };
 
                 // Handle sending responses in a blocking task to avoid starving the backend
                 tokio::task::spawn_blocking(move || match results {

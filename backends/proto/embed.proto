@@ -5,6 +5,8 @@ package embedding.v1;
 service EmbeddingService {
     /// Decode token for a list of prefilled batches
     rpc Embed (EmbedRequest) returns (EmbedResponse);
+    /// Sparse embeddings (for BGE-M3 sparse mode)
+    rpc EmbedSparse (EmbedRequest) returns (EmbedResponse);
     /// Health check
     rpc Health (HealthRequest) returns (HealthResponse);
     /// Predict
