@@ -67,6 +67,10 @@ pub enum Pool {
     Splade,
     /// Select the last token as embedding
     LastToken,
+    /// Apply BGE-M3 sparse embedding using the sparse_linear.pt weights.
+    /// This produces vocab_size sparse vectors by applying a learned linear
+    /// transformation followed by ReLU and max pooling across tokens.
+    BgeM3Sparse,
 }
 
 impl fmt::Display for Pool {
@@ -76,6 +80,7 @@ impl fmt::Display for Pool {
             Pool::Mean => write!(f, "mean"),
             Pool::Splade => write!(f, "splade"),
             Pool::LastToken => write!(f, "last_token"),
+            Pool::BgeM3Sparse => write!(f, "bge_m3_sparse"),
         }
     }
 }

@@ -1,12 +1,13 @@
 use crate::flash_attn::flash_attn_varlen;
 use crate::layers::{index_select, LayerNorm, Linear};
 use crate::models::bert::{
-    BertClassificationHead, BertConfig, BertEmbeddings, BertSpladeHead, ClassificationHead,
-    PositionEmbeddingType, RobertaClassificationHead,
+    BertClassificationHead, BertConfig, BertEmbeddings, BertSpladeHead, BgeM3SparseHead,
+    ClassificationHead, PositionEmbeddingType, RobertaClassificationHead,
 };
 use crate::models::Model;
 use candle::{DType, Device, IndexOp, Result, Tensor};
 use candle_nn::VarBuilder;
+use std::path::Path;
 use text_embeddings_backend_core::{Batch, ModelType, Pool};
 
 struct BertAttention {
@@ -220,6 +221,8 @@ pub struct FlashBertModel {
     pool: Pool,
     classifier: Option<Box<dyn ClassificationHead + Send>>,
     splade: Option<BertSpladeHead>,
+    bge_m3_sparse: Option<BgeM3SparseHead>,
+    vocab_size: usize,
 
     pub device: Device,
 
@@ -228,6 +231,15 @@ pub struct FlashBertModel {
 
 impl FlashBertModel {
     pub fn load(vb: VarBuilder, config: &BertConfig, model_type: ModelType) -> Result<Self> {
+        Self::load_with_model_root(vb, config, model_type, None)
+    }
+
+    pub fn load_with_model_root(
+        vb: VarBuilder,
+        config: &BertConfig,
+        model_type: ModelType,
+        model_root: Option<&Path>,
+    ) -> Result<Self> {
         match vb.device() {
             Device::Cuda(_) => {}
             _ => candle::bail!("FlashBert requires Cuda"),
@@ -242,14 +254,14 @@ impl FlashBertModel {
             candle::bail!("FlashBert only supports absolute position embeddings")
         }
 
-        let (pool, classifier, splade) = match model_type {
+        let (pool, classifier, splade, bge_m3_sparse) = match model_type {
             // Classifier models always use CLS pooling
             ModelType::Classifier => {
                 let pool = Pool::Cls;
 
                 let classifier: Box<dyn ClassificationHead + Send> =
                     Box::new(BertClassificationHead::load(vb.clone(), config)?);
-                (pool, Some(classifier), None)
+                (pool, Some(classifier), None, None)
             }
             ModelType::Embedding(pool) => {
                 let splade = if pool == Pool::Splade {
@@ -257,7 +269,19 @@ impl FlashBertModel {
                 } else {
                     None
                 };
-                (pool, None, splade)
+                let bge_m3_sparse = if pool == Pool::BgeM3Sparse {
+                    match model_root {
+                        Some(root) => Some(BgeM3SparseHead::load(root, &vb, config.vocab_size, config.hidden_size)?),
+                        None => {
+                            candle::bail!(
+                                "BgeM3Sparse pooling requires model_root to be set for loading sparse_linear.pt"
+                            );
+                        }
+                    }
+                } else {
+                    None
+                };
+                (pool, None, splade, bge_m3_sparse)
             }
         };
 
@@ -284,6 +308,8 @@ impl FlashBertModel {
             pool,
             classifier,
             splade,
+            bge_m3_sparse,
+            vocab_size: config.vocab_size,
             device: vb.device().clone(),
             span: tracing::span!(tracing::Level::TRACE, "model"),
         })
@@ -293,6 +319,15 @@ impl FlashBertModel {
         vb: VarBuilder,
         config: &BertConfig,
         model_type: ModelType,
+    ) -> Result<Self> {
+        Self::load_roberta_with_model_root(vb, config, model_type, None)
+    }
+
+    pub fn load_roberta_with_model_root(
+        vb: VarBuilder,
+        config: &BertConfig,
+        model_type: ModelType,
+        model_root: Option<&Path>,
     ) -> Result<Self> {
         match vb.device() {
             Device::Cuda(_) => {}
@@ -308,7 +343,7 @@ impl FlashBertModel {
             candle::bail!("FlashBert only supports absolute position embeddings")
         }
 
-        let (pool, classifier, splade) = match model_type {
+        let (pool, classifier, splade, bge_m3_sparse) = match model_type {
             // Classifier models always use CLS pooling
             ModelType::Classifier => {
                 let pool = Pool::Cls;
@@ -316,7 +351,7 @@ impl FlashBertModel {
                 let classifier: Box<dyn ClassificationHead + Send> = Box::new(
                     RobertaClassificationHead::load(vb.pp("classifier"), config)?,
                 );
-                (pool, Some(classifier), None)
+                (pool, Some(classifier), None, None)
             }
             ModelType::Embedding(pool) => {
                 let splade = if pool == Pool::Splade {
@@ -324,7 +359,19 @@ impl FlashBertModel {
                 } else {
                     None
                 };
-                (pool, None, splade)
+                let bge_m3_sparse = if pool == Pool::BgeM3Sparse {
+                    match model_root {
+                        Some(root) => Some(BgeM3SparseHead::load(root, &vb, config.vocab_size, config.hidden_size)?),
+                        None => {
+                            candle::bail!(
+                                "BgeM3Sparse pooling requires model_root to be set for loading sparse_linear.pt"
+                            );
+                        }
+                    }
+                } else {
+                    None
+                };
+                (pool, None, splade, bge_m3_sparse)
             }
         };
 
@@ -361,6 +408,8 @@ impl FlashBertModel {
             pool,
             classifier,
             splade,
+            bge_m3_sparse,
+            vocab_size: config.vocab_size,
             device: vb.device().clone(),
             span: tracing::span!(tracing::Level::TRACE, "model"),
         })
@@ -487,6 +536,18 @@ impl FlashBertModel {
                     } else {
                         Some(relu_log.max_keepdim(0)?)
                     }
+                }
+                Pool::BgeM3Sparse => {
+                    // Unwrap is safe here since we check during load
+                    let bge_m3_head = self.bge_m3_sparse.as_ref().unwrap();
+
+                    // For flash attention, outputs is [total_tokens, hidden_size]
+                    bge_m3_head.forward(
+                        &outputs,
+                        &input_ids,
+                        batch_size,
+                        &batch.cumulative_seq_lengths,
+                    )?
                 }
             }
         } else {

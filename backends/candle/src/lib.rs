@@ -247,7 +247,9 @@ impl CandleBackend {
                 }
                 BertConfigWrapper::Bert(config) => {
                     tracing::info!("Starting Bert model on {:?}", device);
-                    Ok(Box::new(BertModel::load(vb, &config, model_type).s()?))
+                    Ok(Box::new(
+                        BertModel::load_with_model_root(vb, &config, model_type.clone(), Some(model_path)).s()?,
+                    ))
                 }
             },
             (
@@ -256,7 +258,7 @@ impl CandleBackend {
             ) => {
                 tracing::info!("Starting Bert model on {:?}", device);
                 Ok(Box::new(
-                    BertModel::load_roberta(vb, &config, model_type).s()?,
+                    BertModel::load_roberta_with_model_root(vb, &config, model_type.clone(), Some(model_path)).s()?,
                 ))
             }
             (Config::DistilBert(config), Device::Cpu | Device::Metal(_)) => {
@@ -345,7 +347,9 @@ impl CandleBackend {
                         }
                         BertConfigWrapper::Bert(config) => {
                             tracing::info!("Starting Bert model on {:?}", device);
-                            Ok(Box::new(BertModel::load(vb, &config, model_type).s()?))
+                            Ok(Box::new(
+                                BertModel::load_with_model_root(vb, &config, model_type.clone(), Some(model_path)).s()?,
+                            ))
                         }
                     }
                 }
@@ -363,12 +367,12 @@ impl CandleBackend {
                 {
                     tracing::info!("Starting FlashBert model on {:?}", device);
                     Ok(Box::new(
-                        FlashBertModel::load_roberta(vb, &config, model_type).s()?,
+                        FlashBertModel::load_roberta_with_model_root(vb, &config, model_type.clone(), Some(model_path)).s()?,
                     ))
                 } else {
                     tracing::info!("Starting Bert model on {:?}", device);
                     Ok(Box::new(
-                        BertModel::load_roberta(vb, &config, model_type).s()?,
+                        BertModel::load_roberta_with_model_root(vb, &config, model_type.clone(), Some(model_path)).s()?,
                     ))
                 }
             }

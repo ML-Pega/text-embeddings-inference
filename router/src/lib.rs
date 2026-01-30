@@ -412,6 +412,12 @@ fn get_backend_model_type(
             return Ok(text_embeddings_backend::ModelType::Embedding(
                 text_embeddings_backend::Pool::Splade,
             ));
+        } else if Some(text_embeddings_backend::Pool::BgeM3Sparse) == pooling {
+            // BgeM3Sparse is allowed for any XLMRoberta or BERT-based model
+            // It uses sparse_linear.pt weights instead of MLM head
+            return Ok(text_embeddings_backend::ModelType::Embedding(
+                text_embeddings_backend::Pool::BgeM3Sparse,
+            ));
         } else if arch.ends_with("Classification") {
             if pooling.is_some() {
                 tracing::warn!(

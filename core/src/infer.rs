@@ -128,7 +128,7 @@ impl Infer {
         if self.is_splade() {
             let counter = metrics::counter!("te_request_failure", "err" => "model_type");
             counter.increment(1);
-            let message = "`embed_all` is not available for SPLADE models".to_string();
+            let message = "`embed_all` is not available for sparse embedding models (SPLADE or BgeM3Sparse)".to_string();
             tracing::error!("{message}");
             return Err(TextEmbeddingsError::Backend(BackendError::Inference(
                 message,
@@ -179,7 +179,7 @@ impl Infer {
         if !self.is_splade() {
             let counter = metrics::counter!("te_request_failure", "err" => "model_type");
             counter.increment(1);
-            let message = "Model is not an embedding model with SPLADE pooling".to_string();
+            let message = "Model is not an embedding model with sparse pooling (SPLADE or BgeM3Sparse)".to_string();
             tracing::error!("{message}");
             return Err(TextEmbeddingsError::Backend(BackendError::Inference(
                 message,
@@ -238,7 +238,7 @@ impl Infer {
             let counter = metrics::counter!("te_request_failure", "err" => "model_type");
             counter.increment(1);
 
-            let message = "`normalize` is not available for SPLADE models".to_string();
+            let message = "`normalize` is not available for sparse embedding models (SPLADE or BgeM3Sparse)".to_string();
             tracing::error!("{message}");
             return Err(TextEmbeddingsError::Backend(BackendError::Inference(
                 message,
@@ -507,6 +507,7 @@ impl Infer {
         matches!(
             self.backend.model_type,
             ModelType::Embedding(text_embeddings_backend::Pool::Splade)
+                | ModelType::Embedding(text_embeddings_backend::Pool::BgeM3Sparse)
         )
     }
 

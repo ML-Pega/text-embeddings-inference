@@ -4,6 +4,7 @@ use candle::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn::{Embedding, VarBuilder};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::path::Path;
 use text_embeddings_backend_core::{Batch, ModelType, Pool};
 
 // https://github.com/huggingface/transformers/blob/6eedfa6dd15dc1e22a55ae036f681914e5a0d9a1/src/transformers/models/bert/configuration_bert.py#L1
@@ -558,14 +559,171 @@ impl BertSpladeHead {
     }
 }
 
+/// BGE-M3 Sparse embedding head
+/// Uses a learned linear transformation to produce sparse token weights,
+/// then aggregates them via max pooling across tokens to produce vocab_size sparse vectors.
+#[derive(Debug)]
+pub struct BgeM3SparseHead {
+    /// Linear layer with shape [1, hidden_size] to produce per-token weights
+    sparse_linear_weight: Tensor,
+    vocab_size: usize,
+    span: tracing::Span,
+}
+
+impl BgeM3SparseHead {
+    pub(crate) fn load(
+        model_root: &Path,
+        vb: &VarBuilder,
+        vocab_size: usize,
+        hidden_size: usize,
+    ) -> Result<Self> {
+        let sparse_path = model_root.join("sparse_linear.pt");
+
+        if !sparse_path.exists() {
+            candle::bail!(
+                "sparse_linear.pt not found at {:?}. BGE-M3 sparse embedding requires this file.",
+                sparse_path
+            );
+        }
+
+        // Load the sparse_linear.pt file using VarBuilder
+        // The file contains a weight tensor with shape [1, hidden_size]
+        let sparse_vb = VarBuilder::from_pth(&sparse_path, vb.dtype(), vb.device())?;
+
+        // Get the weight tensor with expected shape [1, hidden_size]
+        let sparse_linear_weight = sparse_vb.get((1, hidden_size), "weight")?;
+
+        Ok(Self {
+            sparse_linear_weight,
+            vocab_size,
+            span: tracing::span!(tracing::Level::TRACE, "bge_m3_sparse"),
+        })
+    }
+
+    /// Forward pass for BGE-M3 sparse embedding
+    /// hidden_states: [batch_size, seq_len, hidden_size] or [total_tokens, hidden_size]
+    /// input_ids: [batch_size, seq_len] or [total_tokens]
+    /// cumulative_seq_lengths: for variable length batches
+    pub(crate) fn forward(
+        &self,
+        hidden_states: &Tensor,
+        input_ids: &Tensor,
+        batch_size: usize,
+        cumulative_seq_lengths: &[u32],
+    ) -> Result<Tensor> {
+        let _enter = self.span.enter();
+
+        // hidden_states shape depends on whether it's padded or not
+        // For padded: [batch_size, seq_len, hidden_size]
+        // For non-padded (flash): [total_tokens, hidden_size]
+
+        let dims = hidden_states.dims();
+        let is_padded = dims.len() == 3;
+
+        if is_padded {
+            // Padded batch: [batch_size, seq_len, hidden_size]
+            let (bs, seq_len, _hidden_size) = hidden_states.dims3()?;
+
+            // Compute token weights: matmul with sparse_linear_weight [1, hidden_size]
+            // Result: [batch_size, seq_len, 1] -> squeeze to [batch_size, seq_len]
+            let token_weights = hidden_states.matmul(&self.sparse_linear_weight.t()?)?;
+            let token_weights = token_weights.squeeze(D::Minus1)?;
+            let token_weights = token_weights.relu()?;
+
+            // For each batch, scatter the token weights to vocab_size dimension
+            // using input_ids as indices, taking max for duplicate tokens
+            let mut batch_results = Vec::with_capacity(bs);
+
+            for b in 0..bs {
+                let batch_weights = token_weights.i(b)?; // [seq_len]
+                let batch_ids = input_ids.i(b)?; // [seq_len]
+
+                // Create output tensor of zeros [vocab_size]
+                let output = Tensor::zeros((self.vocab_size,), token_weights.dtype(), token_weights.device())?;
+
+                // Scatter max: for each position, add weight to output[token_id], taking max
+                let output = self.scatter_max(&output, &batch_ids, &batch_weights, seq_len)?;
+                batch_results.push(output);
+            }
+
+            Tensor::stack(&batch_results, 0)
+        } else {
+            // Non-padded (flash attention) batch: [total_tokens, hidden_size]
+            // Need to use cumulative_seq_lengths to split
+
+            // Compute token weights for all tokens
+            let token_weights = hidden_states.matmul(&self.sparse_linear_weight.t()?)?;
+            let token_weights = token_weights.squeeze(D::Minus1)?; // [total_tokens]
+            let token_weights = token_weights.relu()?;
+
+            let mut batch_results = Vec::with_capacity(batch_size);
+
+            for b in 0..batch_size {
+                let start = cumulative_seq_lengths[b] as usize;
+                let end = cumulative_seq_lengths[b + 1] as usize;
+                let seq_len = end - start;
+
+                let batch_weights = token_weights.narrow(0, start, seq_len)?;
+                let batch_ids = input_ids.narrow(0, start, seq_len)?;
+
+                // Create output tensor of zeros [vocab_size]
+                let output = Tensor::zeros((self.vocab_size,), token_weights.dtype(), token_weights.device())?;
+
+                // Scatter max
+                let output = self.scatter_max(&output, &batch_ids, &batch_weights, seq_len)?;
+                batch_results.push(output);
+            }
+
+            Tensor::stack(&batch_results, 0)
+        }
+    }
+
+    /// Scatter max operation: for each token, update output[token_id] = max(output[token_id], weight)
+    ///
+    /// Note: This implementation moves data to CPU for the scatter operation because
+    /// candle doesn't have native scatter_max support. For better GPU performance,
+    /// a custom CUDA kernel would be needed.
+    fn scatter_max(
+        &self,
+        output: &Tensor,
+        indices: &Tensor,
+        weights: &Tensor,
+        seq_len: usize,
+    ) -> Result<Tensor> {
+        let device = output.device();
+        let dtype = output.dtype();
+
+        // Move to CPU for scatter operation
+        let indices_cpu = indices.to_device(&Device::Cpu)?;
+        let weights_cpu = weights.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+
+        let indices_vec: Vec<u32> = indices_cpu.to_vec1()?;
+        let weights_vec: Vec<f32> = weights_cpu.to_vec1()?;
+        let mut output_vec: Vec<f32> = vec![0.0; self.vocab_size];
+
+        for i in 0..seq_len {
+            let idx = indices_vec[i] as usize;
+            if idx < self.vocab_size {
+                output_vec[idx] = output_vec[idx].max(weights_vec[i]);
+            }
+        }
+
+        // Move result back to original device
+        let result = Tensor::from_vec(output_vec, (self.vocab_size,), &Device::Cpu)?;
+        result.to_device(device)?.to_dtype(dtype)
+    }
+}
+
 pub struct BertModel {
     embeddings: BertEmbeddings,
     encoder: BertEncoder,
     pool: Pool,
     classifier: Option<Box<dyn ClassificationHead + Send>>,
     splade: Option<BertSpladeHead>,
+    bge_m3_sparse: Option<BgeM3SparseHead>,
 
     num_attention_heads: usize,
+    vocab_size: usize,
 
     device: Device,
     dtype: DType,
@@ -575,19 +733,28 @@ pub struct BertModel {
 
 impl BertModel {
     pub fn load(vb: VarBuilder, config: &BertConfig, model_type: ModelType) -> Result<Self> {
+        Self::load_with_model_root(vb, config, model_type, None)
+    }
+
+    pub fn load_with_model_root(
+        vb: VarBuilder,
+        config: &BertConfig,
+        model_type: ModelType,
+        model_root: Option<&Path>,
+    ) -> Result<Self> {
         // Check position embedding type
         if config.position_embedding_type != PositionEmbeddingType::Absolute {
             candle::bail!("Bert only supports absolute position embeddings")
         }
 
-        let (pool, classifier, splade) = match model_type {
+        let (pool, classifier, splade, bge_m3_sparse) = match model_type {
             // Classifier models always use CLS pooling
             ModelType::Classifier => {
                 let pool = Pool::Cls;
 
                 let classifier: Box<dyn ClassificationHead + Send> =
                     Box::new(BertClassificationHead::load(vb.clone(), config)?);
-                (pool, Some(classifier), None)
+                (pool, Some(classifier), None, None)
             }
             ModelType::Embedding(pool) => {
                 let splade = if pool == Pool::Splade {
@@ -595,7 +762,19 @@ impl BertModel {
                 } else {
                     None
                 };
-                (pool, None, splade)
+                let bge_m3_sparse = if pool == Pool::BgeM3Sparse {
+                    match model_root {
+                        Some(root) => Some(BgeM3SparseHead::load(root, &vb, config.vocab_size, config.hidden_size)?),
+                        None => {
+                            candle::bail!(
+                                "BgeM3Sparse pooling requires model_root to be set for loading sparse_linear.pt"
+                            );
+                        }
+                    }
+                } else {
+                    None
+                };
+                (pool, None, splade, bge_m3_sparse)
             }
         };
 
@@ -622,7 +801,9 @@ impl BertModel {
             pool,
             classifier,
             splade,
+            bge_m3_sparse,
             num_attention_heads: config.num_attention_heads,
+            vocab_size: config.vocab_size,
             device: vb.device().clone(),
             dtype: vb.dtype(),
             span: tracing::span!(tracing::Level::TRACE, "model"),
@@ -634,12 +815,21 @@ impl BertModel {
         config: &BertConfig,
         model_type: ModelType,
     ) -> Result<Self> {
+        Self::load_roberta_with_model_root(vb, config, model_type, None)
+    }
+
+    pub fn load_roberta_with_model_root(
+        vb: VarBuilder,
+        config: &BertConfig,
+        model_type: ModelType,
+        model_root: Option<&Path>,
+    ) -> Result<Self> {
         // Check position embedding type
         if config.position_embedding_type != PositionEmbeddingType::Absolute {
             candle::bail!("Bert only supports absolute position embeddings")
         }
 
-        let (pool, classifier, splade) = match model_type {
+        let (pool, classifier, splade, bge_m3_sparse) = match model_type {
             // Classifier models always use CLS pooling
             ModelType::Classifier => {
                 let pool = Pool::Cls;
@@ -647,7 +837,7 @@ impl BertModel {
                 let classifier: Box<dyn ClassificationHead + Send> = Box::new(
                     RobertaClassificationHead::load(vb.pp("classifier"), config)?,
                 );
-                (pool, Some(classifier), None)
+                (pool, Some(classifier), None, None)
             }
             ModelType::Embedding(pool) => {
                 if pool == Pool::LastToken {
@@ -659,7 +849,19 @@ impl BertModel {
                 } else {
                     None
                 };
-                (pool, None, splade)
+                let bge_m3_sparse = if pool == Pool::BgeM3Sparse {
+                    match model_root {
+                        Some(root) => Some(BgeM3SparseHead::load(root, &vb, config.vocab_size, config.hidden_size)?),
+                        None => {
+                            candle::bail!(
+                                "BgeM3Sparse pooling requires model_root to be set for loading sparse_linear.pt"
+                            );
+                        }
+                    }
+                } else {
+                    None
+                };
+                (pool, None, splade, bge_m3_sparse)
             }
         };
 
@@ -696,7 +898,9 @@ impl BertModel {
             pool,
             classifier,
             splade,
+            bge_m3_sparse,
             num_attention_heads: config.num_attention_heads,
+            vocab_size: config.vocab_size,
             device: vb.device().clone(),
             dtype: vb.dtype(),
             span: tracing::span!(tracing::Level::TRACE, "model"),
@@ -885,6 +1089,34 @@ impl BertModel {
                     }
 
                     relu_log.max(1)?
+                }
+                Pool::BgeM3Sparse => {
+                    // Unwrap is safe here since we check during load
+                    let bge_m3_head = self.bge_m3_sparse.as_ref().unwrap();
+
+                    // Get the actual batch size for pooling
+                    let pooling_batch_size = outputs.dims()[0];
+
+                    // Build cumulative_seq_lengths for the selected outputs
+                    let cumulative_lengths: Vec<u32> = if pooled_indices.is_some() {
+                        // If we have pooled_indices, we need to reconstruct cumulative lengths
+                        let mut lengths = vec![0u32];
+                        let mut cumsum = 0u32;
+                        for i in 0..pooling_batch_size {
+                            cumsum += max_length as u32;
+                            lengths.push(cumsum);
+                        }
+                        lengths
+                    } else {
+                        batch.cumulative_seq_lengths.clone()
+                    };
+
+                    bge_m3_head.forward(
+                        &outputs,
+                        &input_ids,
+                        pooling_batch_size,
+                        &cumulative_lengths,
+                    )?
                 }
             };
             Some(pooled_embeddings)
