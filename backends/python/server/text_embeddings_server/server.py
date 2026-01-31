@@ -1,4 +1,5 @@
 import asyncio
+import os
 import torch
 from grpc import aio
 from loguru import logger
@@ -84,10 +85,18 @@ def serve(
             logger.exception("Error when initializing model")
             raise
 
+        # Get gRPC message size from environment variable, default to 256 MB
+        default_max_size = 256 * 1024 * 1024
+        max_grpc_message_size = int(os.environ.get('GRPC_MAX_MESSAGE_SIZE', default_max_size))
+
         server = aio.server(
             interceptors=[
                 ExceptionInterceptor(),
                 UDSOpenTelemetryAioServerInterceptor(),
+            ],
+            options=[
+                ('grpc.max_send_message_length', max_grpc_message_size),
+                ('grpc.max_receive_message_length', max_grpc_message_size),
             ]
         )
         embed_pb2_grpc.add_EmbeddingServiceServicer_to_server(

@@ -6,6 +6,17 @@ use grpc_metadata::InjectTelemetryContext;
 use tonic::transport::{Channel, Uri};
 use tracing::instrument;
 
+/// Default maximum gRPC message size (256 MB)
+const DEFAULT_MAX_GRPC_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
+
+/// Get the maximum gRPC message size from environment variable or use default
+fn get_max_grpc_message_size() -> usize {
+    std::env::var("GRPC_MAX_MESSAGE_SIZE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_GRPC_MESSAGE_SIZE)
+}
+
 /// Text Embeddings Inference gRPC client
 #[derive(Debug, Clone)]
 pub struct Client {
@@ -16,9 +27,12 @@ impl Client {
     /// Returns a client connected to the given url
     pub async fn connect(uri: Uri) -> Result<Self> {
         let channel = Channel::builder(uri).connect().await?;
+        let max_size = get_max_grpc_message_size();
 
         Ok(Self {
-            stub: EmbeddingServiceClient::new(channel),
+            stub: EmbeddingServiceClient::new(channel)
+                .max_decoding_message_size(max_size)
+                .max_encoding_message_size(max_size),
         })
     }
 
@@ -30,9 +44,12 @@ impl Client {
                 tokio::net::UnixStream::connect(path.clone())
             }))
             .await?;
+        let max_size = get_max_grpc_message_size();
 
         Ok(Self {
-            stub: EmbeddingServiceClient::new(channel),
+            stub: EmbeddingServiceClient::new(channel)
+                .max_decoding_message_size(max_size)
+                .max_encoding_message_size(max_size),
         })
     }
 
