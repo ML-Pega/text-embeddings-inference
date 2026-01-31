@@ -18,6 +18,11 @@ install: gen-server
 	pip install --no-deps -r requirements.txt
 	pip install -e .
 
+install-cpu: gen-server
+	pip install pip --upgrade
+	pip install --no-deps -r requirements-cpu.txt
+	pip install -e .
+
 run-dev:
 	python text_embeddings_server/cli.py serve BAAI/bge-small-en
 

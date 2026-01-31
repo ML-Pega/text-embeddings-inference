@@ -11,9 +11,6 @@ from text_embeddings_server.models.model import Model
 from text_embeddings_server.models.masked_model import MaskedLanguageModel
 from text_embeddings_server.models.default_model import DefaultModel
 from text_embeddings_server.models.classification_model import ClassificationModel
-from text_embeddings_server.models.jinaBert_model import FlashJinaBert
-from text_embeddings_server.models.flash_mistral import FlashMistral
-from text_embeddings_server.models.flash_qwen3 import FlashQwen3
 from text_embeddings_server.models.bge_m3_model import BGEM3Model
 from text_embeddings_server.utils.device import get_device, use_ipex
 
@@ -27,14 +24,24 @@ DISABLE_TENSOR_CACHE = os.getenv("DISABLE_TENSOR_CACHE", "false").lower() in [
 # Disable gradients
 torch.set_grad_enabled(False)
 
+# Try to import Flash Attention models (optional - not available on CPU)
 FLASH_ATTENTION = True
+FlashBert = None
+FlashJinaBert = None
+FlashMistral = None
+FlashQwen3 = None
+
 try:
     from text_embeddings_server.models.flash_bert import FlashBert
+    from text_embeddings_server.models.jinaBert_model import FlashJinaBert
+    from text_embeddings_server.models.flash_mistral import FlashMistral
+    from text_embeddings_server.models.flash_qwen3 import FlashQwen3
 except ImportError as e:
     logger.warning(f"Could not import Flash Attention enabled models: {e}")
+    logger.warning("Falling back to default models without Flash Attention")
     FLASH_ATTENTION = False
 
-if FLASH_ATTENTION:
+if FLASH_ATTENTION and FlashBert is not None:
     __all__.append(FlashBert)
 
 
@@ -84,7 +91,11 @@ def get_model(model_path: Path, dtype: Optional[str], pool: str):
         == "jinaai/jina-bert-v2-qk-post-norm--modeling_bert.JinaBertModel"
     ):
         # Add specific offline modeling for model "jinaai/jina-embeddings-v2-base-code" which uses "autoMap" to reference code in other repository
-        return create_model(FlashJinaBert, model_path, device, datatype)
+        if FlashJinaBert is not None:
+            return create_model(FlashJinaBert, model_path, device, datatype)
+        else:
+            logger.warning("FlashJinaBert not available, falling back to DefaultModel")
+            return create_model(DefaultModel, model_path, device, datatype, pool)
 
     # BGE-M3 model detection - uses FlagEmbedding for native sparse support
     if config.model_type == "xlm-roberta" and "bge-m3" in str(model_path).lower():
@@ -107,12 +118,15 @@ def get_model(model_path: Path, dtype: Optional[str], pool: str):
                     )
                 return create_model(DefaultModel, model_path, device, datatype, pool)
 
-            try:
-                return create_model(FlashBert, model_path, device, datatype)
-            except FileNotFoundError:
-                logger.info(
-                    "Do not have safetensors file for this model, use default transformers model path instead"
-                )
+            if FlashBert is not None:
+                try:
+                    return create_model(FlashBert, model_path, device, datatype)
+                except FileNotFoundError:
+                    logger.info(
+                        "Do not have safetensors file for this model, use default transformers model path instead"
+                    )
+                    return create_model(DefaultModel, model_path, device, datatype, pool)
+            else:
                 return create_model(DefaultModel, model_path, device, datatype, pool)
 
         if config.architectures[0].endswith("Classification"):
@@ -122,13 +136,13 @@ def get_model(model_path: Path, dtype: Optional[str], pool: str):
         else:
             return create_model(DefaultModel, model_path, device, datatype, pool)
 
-    if config.model_type == "mistral" and device.type == "hpu":
+    if config.model_type == "mistral" and device.type == "hpu" and FlashMistral is not None:
         try:
             return create_model(FlashMistral, model_path, device, datatype, pool)
         except FileNotFoundError:
             return create_model(DefaultModel, model_path, device, datatype, pool)
 
-    if config.model_type == "qwen3" and device.type == "hpu":
+    if config.model_type == "qwen3" and device.type == "hpu" and FlashQwen3 is not None:
         try:
             return create_model(FlashQwen3, model_path, device, datatype, pool)
         except FileNotFoundError:
