@@ -6,7 +6,7 @@ unit-tests:
 
 gen-server:
 	# Compile protos
-	pip install grpcio-tools==1.62.2 mypy-protobuf==3.6.0 'types-protobuf' --no-cache-dir
+	pip install grpcio-tools==1.62.2 mypy-protobuf==3.6.0 'types-protobuf' --no-cache-dir --break-system-packages
 	mkdir text_embeddings_server/pb || true
 	python -m grpc_tools.protoc -I../../proto --python_out=text_embeddings_server/pb \
 		--grpc_python_out=text_embeddings_server/pb --mypy_out=text_embeddings_server/pb ../../proto/embed.proto
@@ -14,14 +14,14 @@ gen-server:
 	touch text_embeddings_server/pb/__init__.py
 
 install: gen-server
-	pip install pip --upgrade
-	pip install --no-deps -r requirements.txt
-	pip install -e .
+	pip install pip --upgrade --break-system-packages
+	pip install --no-deps -r requirements.txt --break-system-packages
+	pip install -e . --break-system-packages
 
 install-cpu: gen-server
-	pip install pip --upgrade
-	pip install --no-deps -r requirements-cpu.txt
-	pip install -e .
+	pip install pip --upgrade --break-system-packages
+	pip install --no-deps -r requirements-cpu.txt --break-system-packages
+	pip install -e . --break-system-packages
 
 run-dev:
 	python text_embeddings_server/cli.py serve BAAI/bge-small-en
