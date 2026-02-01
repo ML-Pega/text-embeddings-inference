@@ -4,9 +4,11 @@ Optimizations:
 - Native sparse format support (embed_sparse_native) - avoids 250K dense vector transfer
 - Configurable internal batch_size via BGE_M3_BATCH_SIZE env var (default: 32)
 - Pre-cached vocab_size to avoid repeated lookups
+- Auto-downloads sparse embedding required files (sparse_linear.pt, colbert_linear.pt)
 """
 import os
 import sys
+import logging
 
 # Disable tqdm progress bars to avoid BrokenPipeError in Docker
 os.environ["TQDM_DISABLE"] = "1"
@@ -19,8 +21,10 @@ from opentelemetry import trace
 from text_embeddings_server.models.model import Model
 from text_embeddings_server.models.types import PaddedBatch, Embedding
 from text_embeddings_server.pb import embed_pb2
+from text_embeddings_server.utils.bge_m3_downloader import setup_bge_m3_sparse
 
 tracer = trace.get_tracer(__name__)
+logger = logging.getLogger(__name__)
 
 
 class BGEM3Model(Model):
@@ -32,6 +36,10 @@ class BGEM3Model(Model):
     
     Environment variables:
     - BGE_M3_BATCH_SIZE: Internal batch size for FlagEmbedding (default: 32)
+    
+    Auto-downloads required files:
+    - sparse_linear.pt: Required for sparse (lexical) embeddings
+    - colbert_linear.pt: Required for ColBERT embeddings
     """
     
     def __init__(
@@ -48,6 +56,16 @@ class BGEM3Model(Model):
             raise ImportError(
                 "FlagEmbedding is required for BGE-M3 sparse embeddings. "
                 "Please install it with: pip install FlagEmbedding"
+            )
+        
+        # Auto-download sparse embedding files if missing
+        logger.info(f"Checking and downloading sparse embedding files for: {model_path}")
+        if setup_bge_m3_sparse(str(model_path)):
+            logger.info("Sparse embedding files are ready")
+        else:
+            logger.warning(
+                "Could not download sparse embedding files. "
+                "Sparse embeddings may not work correctly."
             )
         
         # Determine if we should use fp16
@@ -133,7 +151,6 @@ class BGEM3Model(Model):
             return_dense=True,
             return_sparse=False,
             return_colbert_vecs=False,
-            
         )
         
         dense_embeddings = output['dense_vecs']
@@ -163,7 +180,6 @@ class BGEM3Model(Model):
             return_dense=False,
             return_sparse=True,
             return_colbert_vecs=False,
-            
         )
         
         # Extract lexical weights - already in sparse dict format
@@ -201,7 +217,6 @@ class BGEM3Model(Model):
             return_dense=False,
             return_sparse=True,
             return_colbert_vecs=False,
-            
         )
         
         lexical_weights_list = output['lexical_weights']
