@@ -1,4 +1,15 @@
-"""BGE-M3 model implementation using FlagEmbedding for native sparse embedding support."""
+"""BGE-M3 model implementation using FlagEmbedding for native sparse embedding support.
+
+Optimizations:
+- Native sparse format support (embed_sparse_native) - avoids 250K dense vector transfer
+- Configurable internal batch_size via BGE_M3_BATCH_SIZE env var (default: 32)
+- Pre-cached vocab_size to avoid repeated lookups
+"""
+import os
+import sys
+
+# Disable tqdm progress bars to avoid BrokenPipeError in Docker
+os.environ["TQDM_DISABLE"] = "1"
 import torch
 
 from pathlib import Path
@@ -7,6 +18,7 @@ from opentelemetry import trace
 
 from text_embeddings_server.models.model import Model
 from text_embeddings_server.models.types import PaddedBatch, Embedding
+from text_embeddings_server.pb import embed_pb2
 
 tracer = trace.get_tracer(__name__)
 
@@ -17,6 +29,9 @@ class BGEM3Model(Model):
     
     Uses FlagEmbedding library internally to leverage BGE-M3's native
     sparse embedding capability which differs from SPLADE.
+    
+    Environment variables:
+    - BGE_M3_BATCH_SIZE: Internal batch size for FlagEmbedding (default: 32)
     """
     
     def __init__(
@@ -62,14 +77,19 @@ class BGEM3Model(Model):
             elif hasattr(config, 'max_position_embeddings'):
                 self.max_input_length = config.max_position_embeddings - position_offset
             else:
-                self.max_input_length = 8192  # BGE-M3 default
+                self.max_input_length = 8192
         else:
-            self.max_input_length = 8192  # BGE-M3 default
+            self.max_input_length = 8192
         
-        # Note: We don't call super().__init__() with a model since we use FlagEmbedding directly
         self.device = device
         self.dtype = dtype
         self._tokenizer = None
+        
+        # Optimization: cache vocab_size
+        self._vocab_size = len(self.flag_model.tokenizer)
+        
+        # Optimization: configurable internal batch size for FlagEmbedding
+        self._internal_batch_size = int(os.environ.get('BGE_M3_BATCH_SIZE', '32'))
 
     @property
     def batch_type(self) -> Type[PaddedBatch]:
@@ -78,31 +98,24 @@ class BGEM3Model(Model):
     def _decode_batch(self, batch: PaddedBatch) -> List[str]:
         """Decode input_ids back to text for FlagEmbedding processing."""
         if self._tokenizer is None:
-            # Use the tokenizer from FlagEmbedding model
             self._tokenizer = self.flag_model.tokenizer
         
         texts = []
         for i in range(len(batch)):
             input_ids = batch.input_ids[i]
-            # Remove padding (attention_mask == 0)
             attention_mask = batch.attention_mask[i]
             valid_length = int(attention_mask.sum().item())
             
             if valid_length == 0:
-                # Edge case: empty input, use placeholder
                 texts.append(" ")
                 continue
                 
             valid_ids = input_ids[:valid_length].tolist()
-            
-            # Decode to text - first try without special tokens
             text = self._tokenizer.decode(valid_ids, skip_special_tokens=True)
             
-            # If result is empty, try keeping special tokens
             if not text or not text.strip():
                 text = self._tokenizer.decode(valid_ids, skip_special_tokens=False)
             
-            # Final fallback: use a space to avoid empty input
             if not text or not text.strip():
                 text = " "
             
@@ -114,18 +127,17 @@ class BGEM3Model(Model):
         """Generate dense embeddings for the batch."""
         texts = self._decode_batch(batch)
         
-        # Use FlagEmbedding to get dense embeddings
         output = self.flag_model.encode(
             texts,
+            batch_size=self._internal_batch_size,
             return_dense=True,
             return_sparse=False,
             return_colbert_vecs=False,
+            
         )
         
-        # Extract dense embeddings
         dense_embeddings = output['dense_vecs']
         
-        # Convert to list of Embedding objects
         results = []
         for i in range(len(batch)):
             embedding_values = dense_embeddings[i].tolist()
@@ -133,40 +145,73 @@ class BGEM3Model(Model):
         
         return results
 
-    @tracer.start_as_current_span("embed_sparse")
-    def embed_sparse(self, batch: PaddedBatch) -> List[Embedding]:
+    @tracer.start_as_current_span("embed_sparse_native")
+    def embed_sparse_native(self, batch: PaddedBatch) -> List[embed_pb2.SparseEmbedding]:
         """
-        Generate sparse embeddings for the batch.
+        Generate sparse embeddings in native sparse format.
         
-        Returns sparse embeddings where the values represent the full vocabulary
-        with most values being zero. The router will convert this to sparse format.
+        This method returns SparseEmbedding protobuf objects directly,
+        avoiding the need to transfer 250K-length dense vectors.
+        Only non-zero values are transmitted, drastically reducing bandwidth.
         """
         texts = self._decode_batch(batch)
         
         # Use FlagEmbedding to get sparse embeddings (lexical weights)
         output = self.flag_model.encode(
             texts,
+            batch_size=self._internal_batch_size,
             return_dense=False,
             return_sparse=True,
             return_colbert_vecs=False,
+            
         )
         
-        # Extract lexical weights (sparse embeddings)
-        # lexical_weights is a list of dicts: [{token_id: weight, ...}, ...]
+        # Extract lexical weights - already in sparse dict format
         lexical_weights_list = output['lexical_weights']
         
-        # Convert to dense format for the existing embed response format
-        # The vocabulary size is determined by the tokenizer
-        vocab_size = len(self.flag_model.tokenizer)
+        # Convert directly to SparseEmbedding protobuf format
+        results = []
+        for lexical_weights in lexical_weights_list:
+            sparse_values = []
+            for token_id, weight in lexical_weights.items():
+                if isinstance(token_id, str):
+                    token_id = int(token_id)
+                sparse_values.append(
+                    embed_pb2.SparseValue(index=token_id, value=float(weight))
+                )
+            results.append(embed_pb2.SparseEmbedding(values=sparse_values))
+        
+        return results
+
+    @tracer.start_as_current_span("embed_sparse")
+    def embed_sparse(self, batch: PaddedBatch) -> List[Embedding]:
+        """
+        Generate sparse embeddings for the batch (legacy dense format).
+        
+        Returns sparse embeddings where the values represent the full vocabulary
+        with most values being zero. The router will convert this to sparse format.
+        
+        Note: Use embed_sparse_native for better performance.
+        """
+        texts = self._decode_batch(batch)
+        
+        output = self.flag_model.encode(
+            texts,
+            batch_size=self._internal_batch_size,
+            return_dense=False,
+            return_sparse=True,
+            return_colbert_vecs=False,
+            
+        )
+        
+        lexical_weights_list = output['lexical_weights']
+        vocab_size = self._vocab_size
         
         results = []
         for lexical_weights in lexical_weights_list:
-            # Create a dense vector with zeros
             sparse_vector = [0.0] * vocab_size
-            # Fill in the non-zero weights
             for token_id, weight in lexical_weights.items():
                 if isinstance(token_id, str):
-                    # If token_id is a string, convert to int
                     token_id = int(token_id)
                 if 0 <= token_id < vocab_size:
                     sparse_vector[token_id] = float(weight)

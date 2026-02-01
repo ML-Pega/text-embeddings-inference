@@ -18,7 +18,7 @@ use serde::Deserialize;
 
 pub use crate::dtype::DType;
 pub use text_embeddings_backend_core::{
-    BackendError, Batch, Embedding, Embeddings, ModelType, Pool,
+    BackendError, Batch, Embedding, Embeddings, ModelType, Pool, SparseValue, SparseEmbedding,
 };
 
 #[cfg(feature = "candle")]

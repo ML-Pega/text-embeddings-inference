@@ -103,6 +103,7 @@ impl Client {
         Ok(response.scores)
     }
 
+    /// Embed sparse - returns sparse embeddings in native sparse format
     #[instrument(skip_all)]
     pub async fn embed_sparse(
         &mut self,
@@ -111,7 +112,7 @@ impl Client {
         position_ids: Vec<u32>,
         cu_seq_lengths: Vec<u32>,
         max_length: u32,
-    ) -> Result<Vec<Embedding>> {
+    ) -> Result<Vec<SparseEmbedding>> {
         let request = tonic::Request::new(EmbedRequest {
             input_ids,
             token_type_ids,

@@ -3,7 +3,7 @@ use crate::tokenization::{EncodingInput, RawEncoding, Tokenization};
 use crate::TextEmbeddingsError;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use text_embeddings_backend::{Backend, BackendError, Embedding, ModelType};
+use text_embeddings_backend::{Backend, BackendError, Embedding, ModelType, SparseValue};
 use tokenizers::TruncationDirection;
 use tokio::sync::{mpsc, oneshot, watch, Notify, OwnedSemaphorePermit, Semaphore};
 use tracing::instrument;
@@ -174,7 +174,7 @@ impl Infer {
         truncation_direction: TruncationDirection,
         prompt_name: Option<String>,
         permit: OwnedSemaphorePermit,
-    ) -> Result<PooledEmbeddingsInferResponse, TextEmbeddingsError> {
+    ) -> Result<SparseEmbeddingsInferResponse, TextEmbeddingsError> {
         let start_time = Instant::now();
 
         if !self.is_splade() {
@@ -200,8 +200,23 @@ impl Infer {
             )
             .await?;
 
-        let InferResult::PooledEmbedding(response) = results else {
-            panic!("unexpected enum variant")
+        // Handle both SparseEmbedding and PooledEmbedding (fallback for dense format)
+        let response = match results {
+            InferResult::SparseEmbedding(response) => response,
+            InferResult::PooledEmbedding(pooled) => {
+                // Convert dense to sparse format for backward compatibility
+                let sparse_values: Vec<SparseValueResult> = pooled.results
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &v)| v != 0.0)
+                    .map(|(i, &v)| SparseValueResult { index: i as u32, value: v })
+                    .collect();
+                SparseEmbeddingsInferResponse {
+                    results: sparse_values,
+                    metadata: pooled.metadata,
+                }
+            }
+            _ => panic!("unexpected enum variant"),
         };
 
         // Timings
@@ -635,6 +650,21 @@ async fn backend_task(backend: Backend, mut embed_receiver: mpsc::Receiver<NextB
                                         metadata,
                                     })
                                 }
+                                Embedding::Sparse(sparse_emb) => {
+                                    // Convert internal SparseEmbedding to SparseValueResult
+                                    let sparse_values: Vec<SparseValueResult> = sparse_emb
+                                        .values
+                                        .into_iter()
+                                        .map(|sv| SparseValueResult {
+                                            index: sv.index,
+                                            value: sv.value,
+                                        })
+                                        .collect();
+                                    InferResult::SparseEmbedding(SparseEmbeddingsInferResponse {
+                                        results: sparse_values,
+                                        metadata,
+                                    })
+                                }
                             };
 
                             let _ = m.response_tx.send(Ok(results));
@@ -664,6 +694,7 @@ pub(crate) enum InferResult {
     Classification(ClassificationInferResponse),
     PooledEmbedding(PooledEmbeddingsInferResponse),
     AllEmbedding(AllEmbeddingsInferResponse),
+    SparseEmbedding(SparseEmbeddingsInferResponse),
 }
 
 #[derive(Debug)]
@@ -681,5 +712,19 @@ pub struct PooledEmbeddingsInferResponse {
 #[derive(Debug)]
 pub struct AllEmbeddingsInferResponse {
     pub results: Vec<Vec<f32>>,
+    pub metadata: InferMetadata,
+}
+
+/// Single sparse value with index and value
+#[derive(Debug, Clone)]
+pub struct SparseValueResult {
+    pub index: u32,
+    pub value: f32,
+}
+
+/// Sparse embeddings response - only contains non-zero values
+#[derive(Debug)]
+pub struct SparseEmbeddingsInferResponse {
+    pub results: Vec<SparseValueResult>,
     pub metadata: InferMetadata,
 }

@@ -6,6 +6,7 @@ use nohash_hasher::BuildNoHashHasher;
 use std::collections::HashMap;
 use text_embeddings_backend_core::{
     Backend, BackendError, Batch, Embedding, Embeddings, ModelType, Pool, Predictions,
+    SparseEmbedding, SparseValue,
 };
 use tokio::runtime::Runtime;
 
@@ -109,6 +110,7 @@ impl Backend for PythonBackend {
         }
         let batch_size = batch.len();
 
+        // Call embed_sparse which now returns SparseEmbedding format
         let results = self
             .tokio_runtime
             .block_on(self.backend_client.clone().embed_sparse(
@@ -119,12 +121,21 @@ impl Backend for PythonBackend {
                 batch.max_length,
             ))
             .map_err(|err| BackendError::Inference(err.to_string()))?;
-        let pooled_embeddings: Vec<Vec<f32>> = results.into_iter().map(|r| r.values).collect();
 
         let mut embeddings =
             HashMap::with_capacity_and_hasher(batch_size, BuildNoHashHasher::default());
-        for (i, e) in pooled_embeddings.into_iter().enumerate() {
-            embeddings.insert(i, Embedding::Pooled(e));
+
+        // Convert protobuf SparseEmbedding to internal SparseEmbedding
+        for (i, sparse_emb) in results.into_iter().enumerate() {
+            let sparse_values: Vec<SparseValue> = sparse_emb
+                .values
+                .into_iter()
+                .map(|sv| SparseValue {
+                    index: sv.index,
+                    value: sv.value,
+                })
+                .collect();
+            embeddings.insert(i, Embedding::Sparse(SparseEmbedding::new(sparse_values)));
         }
 
         Ok(embeddings)

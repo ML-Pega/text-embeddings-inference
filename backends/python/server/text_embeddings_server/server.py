@@ -41,20 +41,40 @@ class EmbeddingService(embed_pb2_grpc.EmbeddingServiceServicer):
         return embed_pb2.EmbedResponse(embeddings=embeddings)
 
     async def EmbedSparse(self, request, context):
-        """Separate gRPC method for sparse embeddings (used by bge-m3-all mode)"""
+        """Separate gRPC method for sparse embeddings - returns sparse format directly"""
         max_input_length = self.model.max_input_length
         batch = self.model.batch_type.from_pb(
             request, self.model.device, max_input_length
         )
 
-        # Call embed_sparse if available, otherwise fall back to embed
-        if hasattr(self.model, 'embed_sparse'):
+        # Call embed_sparse_native if available (returns sparse format directly)
+        if hasattr(self.model, 'embed_sparse_native'):
+            sparse_embeddings = self.model.embed_sparse_native(batch)
+            return embed_pb2.EmbedSparseResponse(embeddings=sparse_embeddings)
+        elif hasattr(self.model, 'embed_sparse'):
+            # Fallback to dense format if native sparse not available
             embeddings = self.model.embed_sparse(batch)
+            # Convert dense to sparse format
+            sparse_embeddings = []
+            for emb in embeddings:
+                sparse_values = []
+                for idx, val in enumerate(emb.values):
+                    if val != 0.0:
+                        sparse_values.append(embed_pb2.SparseValue(index=idx, value=val))
+                sparse_embeddings.append(embed_pb2.SparseEmbedding(values=sparse_values))
+            return embed_pb2.EmbedSparseResponse(embeddings=sparse_embeddings)
         else:
             # Fallback for models without embed_sparse
             embeddings = self.model.embed(batch)
-
-        return embed_pb2.EmbedResponse(embeddings=embeddings)
+            # Convert to sparse (all values as sparse)
+            sparse_embeddings = []
+            for emb in embeddings:
+                sparse_values = [
+                    embed_pb2.SparseValue(index=idx, value=val) 
+                    for idx, val in enumerate(emb.values) if val != 0.0
+                ]
+                sparse_embeddings.append(embed_pb2.SparseEmbedding(values=sparse_values))
+            return embed_pb2.EmbedSparseResponse(embeddings=sparse_embeddings)
 
     async def Predict(self, request, context):
         max_input_length = self.model.max_input_length

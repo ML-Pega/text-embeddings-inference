@@ -5,8 +5,8 @@ package embedding.v1;
 service EmbeddingService {
     /// Decode token for a list of prefilled batches
     rpc Embed (EmbedRequest) returns (EmbedResponse);
-    /// Sparse embeddings (for BGE-M3 sparse mode)
-    rpc EmbedSparse (EmbedRequest) returns (EmbedResponse);
+    /// Sparse embeddings (for BGE-M3 sparse mode) - returns sparse format
+    rpc EmbedSparse (EmbedRequest) returns (EmbedSparseResponse);
     /// Health check
     rpc Health (HealthRequest) returns (HealthResponse);
     /// Predict
@@ -31,6 +31,22 @@ message Embedding {
 
 message EmbedResponse {
     repeated Embedding embeddings = 1;
+}
+
+/// Sparse value with index and weight
+message SparseValue {
+    uint32 index = 1;
+    float value = 2;
+}
+
+/// Sparse embedding containing only non-zero values
+message SparseEmbedding {
+    repeated SparseValue values = 1;
+}
+
+/// Response for sparse embeddings
+message EmbedSparseResponse {
+    repeated SparseEmbedding embeddings = 1;
 }
 
 message Score {

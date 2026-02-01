@@ -26,12 +26,59 @@ impl Batch {
     }
 }
 
+/// A single sparse value with index and weight
+#[derive(Debug, Clone)]
+pub struct SparseValue {
+    pub index: u32,
+    pub value: f32,
+}
+
+/// Sparse embedding representation - only stores non-zero values
+#[derive(Debug, Clone)]
+pub struct SparseEmbedding {
+    pub values: Vec<SparseValue>,
+}
+
+impl SparseEmbedding {
+    /// Create a new sparse embedding from index-value pairs
+    pub fn new(values: Vec<SparseValue>) -> Self {
+        Self { values }
+    }
+
+    /// Create from a dense vector (extracts non-zero values)
+    pub fn from_dense(dense: &[f32]) -> Self {
+        let values: Vec<SparseValue> = dense
+            .iter()
+            .enumerate()
+            .filter(|(_, &v)| v != 0.0)
+            .map(|(i, &v)| SparseValue {
+                index: i as u32,
+                value: v,
+            })
+            .collect();
+        Self { values }
+    }
+
+    /// Convert to dense vector of given size
+    pub fn to_dense(&self, vocab_size: usize) -> Vec<f32> {
+        let mut dense = vec![0.0f32; vocab_size];
+        for sv in &self.values {
+            if (sv.index as usize) < vocab_size {
+                dense[sv.index as usize] = sv.value;
+            }
+        }
+        dense
+    }
+}
+
 pub enum Embedding {
     Pooled(Vec<f32>),
     All(Vec<Vec<f32>>),
+    Sparse(SparseEmbedding),
 }
 
 pub type Embeddings = IntMap<usize, Embedding>;
+pub type SparseEmbeddings = IntMap<usize, SparseEmbedding>;
 pub type Predictions = IntMap<usize, Vec<f32>>;
 
 pub trait Backend {

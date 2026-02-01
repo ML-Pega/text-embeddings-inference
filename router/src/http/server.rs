@@ -32,7 +32,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use text_embeddings_backend::BackendError;
 use text_embeddings_core::infer::{
-    AllEmbeddingsInferResponse, Infer, InferMetadata, PooledEmbeddingsInferResponse,
+    AllEmbeddingsInferResponse, Infer, InferMetadata, PooledEmbeddingsInferResponse, SparseEmbeddingsInferResponse, SparseValueResult,
 };
 use text_embeddings_core::tokenization::{into_tokens, SimpleToken as CoreSimpleToken};
 use text_embeddings_core::TextEmbeddingsError;
@@ -776,14 +776,15 @@ async fn embed_sparse(
 
     let start_time = Instant::now();
 
-    let sparsify = |values: Vec<f32>| {
-        let mut sparse_values = Vec::with_capacity(values.len());
-        for (index, value) in values.into_iter().enumerate() {
-            if value != 0.0 {
-                sparse_values.push(SparseValue { index, value });
-            }
-        }
-        sparse_values
+    // Convert internal SparseValueResult to HTTP SparseValue
+    let convert_sparse = |results: Vec<SparseValueResult>| -> Vec<SparseValue> {
+        results
+            .into_iter()
+            .map(|sv| SparseValue {
+                index: sv.index as usize,
+                value: sv.value,
+            })
+            .collect()
     };
     let truncate = req.truncate.unwrap_or(info.auto_truncate);
 
@@ -808,7 +809,7 @@ async fn embed_sparse(
             metrics::counter!("te_request_success", "method" => "single").increment(1);
 
             (
-                EmbedSparseResponse(vec![sparsify(response.results)]),
+                EmbedSparseResponse(vec![convert_sparse(response.results)]),
                 ResponseMetadata::new(
                     compute_chars,
                     response.metadata.prompt_tokens,
@@ -874,7 +875,7 @@ async fn embed_sparse(
                             permit,
                         )
                         .await?;
-                    Ok((sparsify(response.results), response.metadata))
+                    Ok((convert_sparse(response.results), response.metadata))
                 })
             }
             let results = join_all(futures)
