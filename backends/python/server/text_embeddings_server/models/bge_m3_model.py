@@ -1,9 +1,11 @@
-"""BGE-M3 model implementation - OPTIMIZED v2.
+"""BGE-M3 model implementation - GPU OPTIMIZED v3.
 
-Key optimization: Direct forward pass using pre-tokenized input_ids.
-Bypasses FlagEmbedding's encode() which does decode → re-tokenize.
+Key optimizations:
+1. Direct forward pass using pre-tokenized input_ids
+2. GPU-accelerated sparse embedding processing
+3. Minimized CPU-GPU data transfers
 
-Performance improvement: ~10x faster for batch processing.
+Performance: ~10x faster batch processing + GPU acceleration for sparse operations.
 """
 
 import os
@@ -29,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 class BGEM3Model(Model):
     """
-    Optimized BGE-M3 model - directly uses pre-tokenized input_ids.
+    GPU-optimized BGE-M3 model.
     """
 
     def __init__(
@@ -47,12 +49,20 @@ class BGEM3Model(Model):
                 "FlagEmbedding is required for BGE-M3. " "pip install FlagEmbedding"
             )
 
-        logger.info(f"[OPTIMIZED v2] Initializing BGE-M3 model from: {model_path}")
+        logger.info(f"[GPU OPTIMIZED v3] Initializing BGE-M3 model from: {model_path}")
 
         # Download sparse files if needed
         if setup_bge_m3_sparse(str(model_path)):
             logger.info("Sparse embedding files ready")
 
+
+        # Configure CUDA memory allocator for stability
+        if device.type == "cuda":
+            import os
+            os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", 
+                                  "max_split_size_mb:512,expandable_segments:True")
+            torch.cuda.empty_cache()
+            logger.info(f"CUDA allocator configured for {device}")
         use_fp16 = dtype in [torch.float16, torch.bfloat16]
 
         # Load the model
@@ -82,7 +92,7 @@ class BGEM3Model(Model):
         self.dtype = dtype
         self._vocab_size = len(tokenizer)
 
-        logger.info(f"[OPTIMIZED v2] Ready - device={device}, vocab={self._vocab_size}")
+        logger.info(f"[GPU OPTIMIZED v3] Ready - device={device}, vocab={self._vocab_size}")
 
     @property
     def batch_type(self) -> Type[PaddedBatch]:
@@ -129,10 +139,10 @@ class BGEM3Model(Model):
         self, batch: PaddedBatch
     ) -> List[embed_pb2.SparseEmbedding]:
         """
-        Generate sparse embeddings - OPTIMIZED.
+        Generate sparse embeddings - GPU OPTIMIZED.
 
-        Directly uses input_ids, bypassing FlagEmbedding's encode().
-        Returns native sparse format (only non-zero values).
+        All heavy processing done on GPU with vectorized operations.
+        Only transfers final results to CPU.
         """
         inputs = self._prepare_inputs(batch)
 
@@ -142,35 +152,53 @@ class BGEM3Model(Model):
             return_dense=False,
             return_sparse=True,
             return_colbert_vecs=False,
-            return_sparse_embedding=False,  # Get raw token weights
+            return_sparse_embedding=False,
         )
 
-        token_weights = outputs["sparse_vecs"]  # [batch, seq_len, 1]
+        token_weights = outputs["sparse_vecs"]
         if token_weights.dim() == 3:
-            token_weights = token_weights.squeeze(-1)  # [batch, seq_len]
+            token_weights = token_weights.squeeze(-1)
 
-        # Apply ReLU to ensure non-negative
         token_weights = torch.relu(token_weights)
-
         input_ids = inputs["input_ids"]
         batch_size = input_ids.size(0)
 
+        # GPU-accelerated processing
         results = []
+        
+        # Create special tokens mask (reuse across batch)
+        unused_mask = torch.zeros(self._vocab_size, dtype=torch.bool, device=self.device)
+        for tid in self._unused_tokens:
+            if 0 <= tid < self._vocab_size:
+                unused_mask[tid] = True
+        
         for i in range(batch_size):
-            weights = token_weights[i].cpu().tolist()
-            ids = input_ids[i].cpu().tolist()
-
-            # Aggregate: max weight per token_id
-            lexical = defaultdict(float)
-            for w, tid in zip(weights, ids):
-                if w > 0 and tid not in self._unused_tokens:
-                    if w > lexical[tid]:
-                        lexical[tid] = w
-
-            sparse_values = [
-                embed_pb2.SparseValue(index=int(tid), value=float(w))
-                for tid, w in lexical.items()
-            ]
+            weights_i = token_weights[i]
+            ids_i = input_ids[i]
+            
+            # Filter on GPU
+            valid_mask = (weights_i > 0) & (~unused_mask[ids_i])
+            
+            if valid_mask.any():
+                valid_weights = weights_i[valid_mask]
+                valid_ids = ids_i[valid_mask]
+                
+                # Aggregate on GPU using scatter_reduce
+                unique_ids, inverse_indices = torch.unique(valid_ids, return_inverse=True)
+                max_weights = torch.zeros(len(unique_ids), device=self.device, dtype=valid_weights.dtype)
+                max_weights.scatter_reduce_(0, inverse_indices, valid_weights, reduce='amax', include_self=False)
+                
+                # Transfer to CPU only at the end
+                unique_ids_cpu = unique_ids.cpu().numpy()
+                max_weights_cpu = max_weights.cpu().numpy()
+                
+                sparse_values = [
+                    embed_pb2.SparseValue(index=int(tid), value=float(w))
+                    for tid, w in zip(unique_ids_cpu, max_weights_cpu)
+                ]
+            else:
+                sparse_values = []
+            
             results.append(embed_pb2.SparseEmbedding(values=sparse_values))
 
         return results
@@ -197,20 +225,43 @@ class BGEM3Model(Model):
         batch_size = input_ids.size(0)
         vocab_size = self._vocab_size
 
+        # GPU-accelerated processing
         results = []
+        
+        # Create special tokens mask (reuse across batch)
+        unused_mask = torch.zeros(self._vocab_size, dtype=torch.bool, device=self.device)
+        for tid in self._unused_tokens:
+            if 0 <= tid < self._vocab_size:
+                unused_mask[tid] = True
+        
         for i in range(batch_size):
-            weights = token_weights[i].cpu().tolist()
-            ids = input_ids[i].cpu().tolist()
-
-            sparse_vec = [0.0] * vocab_size
-            for w, tid in zip(weights, ids):
-                if w > 0 and tid not in self._unused_tokens:
-                    tid = int(tid)
-                    if 0 <= tid < vocab_size and w > sparse_vec[tid]:
-                        sparse_vec[tid] = w
-
-            results.append(Embedding(values=sparse_vec))
-
+            weights_i = token_weights[i]
+            ids_i = input_ids[i]
+            
+            # Filter on GPU
+            valid_mask = (weights_i > 0) & (~unused_mask[ids_i])
+            
+            if valid_mask.any():
+                valid_weights = weights_i[valid_mask]
+                valid_ids = ids_i[valid_mask]
+                
+                # Aggregate on GPU using scatter_reduce
+                unique_ids, inverse_indices = torch.unique(valid_ids, return_inverse=True)
+                max_weights = torch.zeros(len(unique_ids), device=self.device, dtype=valid_weights.dtype)
+                max_weights.scatter_reduce_(0, inverse_indices, valid_weights, reduce='amax', include_self=False)
+                
+                # Transfer to CPU only at the end
+                unique_ids_cpu = unique_ids.cpu().numpy()
+                max_weights_cpu = max_weights.cpu().numpy()
+                
+                sparse_values = [
+                    embed_pb2.SparseValue(index=int(tid), value=float(w))
+                    for tid, w in zip(unique_ids_cpu, max_weights_cpu)
+                ]
+            else:
+                sparse_values = []
+            
+            results.append(embed_pb2.SparseEmbedding(values=sparse_values))
         return results
 
     def predict(self, batch: PaddedBatch) -> List[Any]:
