@@ -64,6 +64,7 @@ class BGEM3Model(Model):
 
         # Direct access to internal model for optimized forward
         self._model = self.flag_model.model
+        self._model = self._model.to(device)  # Explicitly move model to device
         self._model.eval()
 
         # Cache tokenizer special tokens for filtering
@@ -95,7 +96,7 @@ class BGEM3Model(Model):
         if hasattr(batch, "token_type_ids") and batch.token_type_ids is not None:
             token_type_ids = batch.token_type_ids.to(self.device)
         else:
-            token_type_ids = torch.zeros_like(input_ids)
+            token_type_ids = torch.zeros_like(input_ids, device=self.device)
 
         return {
             "input_ids": input_ids,
