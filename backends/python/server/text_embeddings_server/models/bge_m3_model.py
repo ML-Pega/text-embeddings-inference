@@ -1,4 +1,4 @@
-"""BGE-M3 model implementation - GPU OPTIMIZED v3.
+"""BGE-M3 model implementation - GPU OPTIMIZED v4 - FULLY VECTORIZED.
 
 Key optimizations:
 1. Direct forward pass using pre-tokenized input_ids
@@ -49,7 +49,7 @@ class BGEM3Model(Model):
                 "FlagEmbedding is required for BGE-M3. " "pip install FlagEmbedding"
             )
 
-        logger.info(f"[GPU OPTIMIZED v3] Initializing BGE-M3 model from: {model_path}")
+        logger.info(f"[GPU OPTIMIZED v4 - FULLY VECTORIZED] Initializing BGE-M3 model from: {model_path}")
 
         # Download sparse files if needed
         if setup_bge_m3_sparse(str(model_path)):
@@ -92,7 +92,7 @@ class BGEM3Model(Model):
         self.dtype = dtype
         self._vocab_size = len(tokenizer)
 
-        logger.info(f"[GPU OPTIMIZED v3] Ready - device={device}, vocab={self._vocab_size}")
+        logger.info(f"[GPU OPTIMIZED v4 - FULLY VECTORIZED] Ready - device={device}, vocab={self._vocab_size}")
 
     @property
     def batch_type(self) -> Type[PaddedBatch]:
@@ -163,43 +163,59 @@ class BGEM3Model(Model):
         input_ids = inputs["input_ids"]
         batch_size = input_ids.size(0)
 
-        # GPU-accelerated processing
+        # FULLY VECTORIZED GPU processing - process entire batch at once
         results = []
         
-        # Create special tokens mask (reuse across batch)
+        # Create special tokens mask
         unused_mask = torch.zeros(self._vocab_size, dtype=torch.bool, device=self.device)
         for tid in self._unused_tokens:
             if 0 <= tid < self._vocab_size:
                 unused_mask[tid] = True
         
-        for i in range(batch_size):
-            weights_i = token_weights[i]
-            ids_i = input_ids[i]
+        # Process entire batch in parallel
+        # Filter: keep only tokens with positive weights and not in unused list
+        valid_masks = (token_weights > 0) & (~unused_mask[input_ids])  # (batch, seq_len)
+        
+        # Flatten everything for batch processing
+        batch_indices = torch.arange(batch_size, device=self.device).unsqueeze(1).expand_as(input_ids)
+        
+        # Get all valid entries across the entire batch
+        flat_valid_mask = valid_masks.flatten()
+        flat_batch_indices = batch_indices.flatten()[flat_valid_mask]
+        flat_token_ids = input_ids.flatten()[flat_valid_mask]
+        flat_weights = token_weights.flatten()[flat_valid_mask]
+        
+        if len(flat_batch_indices) > 0:
+            # Create unique key for each (batch_idx, token_id) pair
+            # Use large multiplier to avoid collision (vocab size ~ 250K, so 1M is safe)
+            combined_keys = flat_batch_indices * 1000000 + flat_token_ids
             
-            # Filter on GPU
-            valid_mask = (weights_i > 0) & (~unused_mask[ids_i])
+            # Find unique combinations and aggregate weights
+            unique_keys, inverse_indices = torch.unique(combined_keys, return_inverse=True)
+            aggregated_weights = torch.zeros(len(unique_keys), device=self.device, dtype=flat_weights.dtype)
+            aggregated_weights.scatter_reduce_(0, inverse_indices, flat_weights, reduce='amax', include_self=False)
             
-            if valid_mask.any():
-                valid_weights = weights_i[valid_mask]
-                valid_ids = ids_i[valid_mask]
-                
-                # Aggregate on GPU using scatter_reduce
-                unique_ids, inverse_indices = torch.unique(valid_ids, return_inverse=True)
-                max_weights = torch.zeros(len(unique_ids), device=self.device, dtype=valid_weights.dtype)
-                max_weights.scatter_reduce_(0, inverse_indices, valid_weights, reduce='amax', include_self=False)
-                
-                # Transfer to CPU only at the end
-                unique_ids_cpu = unique_ids.cpu().numpy()
-                max_weights_cpu = max_weights.cpu().numpy()
-                
-                sparse_values = [
-                    embed_pb2.SparseValue(index=int(tid), value=float(w))
-                    for tid, w in zip(unique_ids_cpu, max_weights_cpu)
-                ]
-            else:
-                sparse_values = []
+            # Decompose keys back to (batch_idx, token_id)
+            result_batch_indices = (unique_keys // 1000000).cpu()
+            result_token_ids = (unique_keys % 1000000).cpu()
+            result_weights = aggregated_weights.cpu()
             
-            results.append(embed_pb2.SparseEmbedding(values=sparse_values))
+            # Group by batch index (only one CPU transfer!)
+            for i in range(batch_size):
+                mask = (result_batch_indices == i)
+                if mask.any():
+                    token_ids_i = result_token_ids[mask].numpy()
+                    weights_i = result_weights[mask].numpy()
+                    sparse_values = [
+                        embed_pb2.SparseValue(index=int(tid), value=float(w))
+                        for tid, w in zip(token_ids_i, weights_i)
+                    ]
+                else:
+                    sparse_values = []
+                results.append(embed_pb2.SparseEmbedding(values=sparse_values))
+        else:
+            # No valid tokens in entire batch
+            results = [embed_pb2.SparseEmbedding(values=[]) for _ in range(batch_size)]
 
         return results
 
@@ -225,43 +241,59 @@ class BGEM3Model(Model):
         batch_size = input_ids.size(0)
         vocab_size = self._vocab_size
 
-        # GPU-accelerated processing
+        # FULLY VECTORIZED GPU processing - process entire batch at once
         results = []
         
-        # Create special tokens mask (reuse across batch)
+        # Create special tokens mask
         unused_mask = torch.zeros(self._vocab_size, dtype=torch.bool, device=self.device)
         for tid in self._unused_tokens:
             if 0 <= tid < self._vocab_size:
                 unused_mask[tid] = True
         
-        for i in range(batch_size):
-            weights_i = token_weights[i]
-            ids_i = input_ids[i]
+        # Process entire batch in parallel
+        # Filter: keep only tokens with positive weights and not in unused list
+        valid_masks = (token_weights > 0) & (~unused_mask[input_ids])  # (batch, seq_len)
+        
+        # Flatten everything for batch processing
+        batch_indices = torch.arange(batch_size, device=self.device).unsqueeze(1).expand_as(input_ids)
+        
+        # Get all valid entries across the entire batch
+        flat_valid_mask = valid_masks.flatten()
+        flat_batch_indices = batch_indices.flatten()[flat_valid_mask]
+        flat_token_ids = input_ids.flatten()[flat_valid_mask]
+        flat_weights = token_weights.flatten()[flat_valid_mask]
+        
+        if len(flat_batch_indices) > 0:
+            # Create unique key for each (batch_idx, token_id) pair
+            # Use large multiplier to avoid collision (vocab size ~ 250K, so 1M is safe)
+            combined_keys = flat_batch_indices * 1000000 + flat_token_ids
             
-            # Filter on GPU
-            valid_mask = (weights_i > 0) & (~unused_mask[ids_i])
+            # Find unique combinations and aggregate weights
+            unique_keys, inverse_indices = torch.unique(combined_keys, return_inverse=True)
+            aggregated_weights = torch.zeros(len(unique_keys), device=self.device, dtype=flat_weights.dtype)
+            aggregated_weights.scatter_reduce_(0, inverse_indices, flat_weights, reduce='amax', include_self=False)
             
-            if valid_mask.any():
-                valid_weights = weights_i[valid_mask]
-                valid_ids = ids_i[valid_mask]
-                
-                # Aggregate on GPU using scatter_reduce
-                unique_ids, inverse_indices = torch.unique(valid_ids, return_inverse=True)
-                max_weights = torch.zeros(len(unique_ids), device=self.device, dtype=valid_weights.dtype)
-                max_weights.scatter_reduce_(0, inverse_indices, valid_weights, reduce='amax', include_self=False)
-                
-                # Transfer to CPU only at the end
-                unique_ids_cpu = unique_ids.cpu().numpy()
-                max_weights_cpu = max_weights.cpu().numpy()
-                
-                sparse_values = [
-                    embed_pb2.SparseValue(index=int(tid), value=float(w))
-                    for tid, w in zip(unique_ids_cpu, max_weights_cpu)
-                ]
-            else:
-                sparse_values = []
+            # Decompose keys back to (batch_idx, token_id)
+            result_batch_indices = (unique_keys // 1000000).cpu()
+            result_token_ids = (unique_keys % 1000000).cpu()
+            result_weights = aggregated_weights.cpu()
             
-            results.append(embed_pb2.SparseEmbedding(values=sparse_values))
+            # Group by batch index (only one CPU transfer!)
+            for i in range(batch_size):
+                mask = (result_batch_indices == i)
+                if mask.any():
+                    token_ids_i = result_token_ids[mask].numpy()
+                    weights_i = result_weights[mask].numpy()
+                    sparse_values = [
+                        embed_pb2.SparseValue(index=int(tid), value=float(w))
+                        for tid, w in zip(token_ids_i, weights_i)
+                    ]
+                else:
+                    sparse_values = []
+                results.append(embed_pb2.SparseEmbedding(values=sparse_values))
+        else:
+            # No valid tokens in entire batch
+            results = [embed_pb2.SparseEmbedding(values=[]) for _ in range(batch_size)]
         return results
 
     def predict(self, batch: PaddedBatch) -> List[Any]:
